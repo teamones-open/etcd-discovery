@@ -4,16 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
+	"log"
+	"sync"
+	"time"
+
 	"github.com/pkg/errors"
 	"github.com/teamones-open/etcd-discovery/common"
 	"go.etcd.io/etcd/clientv3"
-	"log"
-	"time"
 )
 
 const (
-	_ttl = 10
+	_ttl = 30
 )
 
 type Register struct {
@@ -22,82 +23,158 @@ type Register struct {
 	lease     clientv3.Lease
 	info      *NodeInfo
 	closeChan chan error
+
+	stopOnce sync.Once
 }
 
 func NewRegister(info *NodeInfo, conf clientv3.Config) (reg *Register, err error) {
 	r := &Register{}
 	r.closeChan = make(chan error)
 	r.info = info
+
 	r.cli, err = clientv3.New(conf)
-	return r, err
+	if err != nil {
+		return nil, err
+	}
+
+	return r, nil
 }
 
 func (r *Register) Run() {
-	dur := time.Duration(time.Second)
-	timer := time.NewTicker(dur)
-	r.register()
+	timer := time.NewTicker(10 * time.Second)
+	defer timer.Stop()
+
+	log.Printf("[Register] Run start node:%s addr:%s", r.info.UniqueId, r.info.Addr)
+
+	if err := r.register(); err != nil {
+		log.Printf("[Register] initial register failed: %+v", err)
+		return
+	}
+
 	for {
 		select {
 		case <-timer.C:
-			r.keepAlive()
+			if err := r.keepAlive(); err != nil {
+				log.Printf("[Register] keepAlive failed: %+v", err)
+			}
+
 		case <-r.closeChan:
-			goto EXIT
+			log.Printf("[Register] Run exit node:%s", r.info.UniqueId)
+			return
 		}
 	}
-EXIT:
-	log.Printf("[Register] Run exit...")
 }
 
 func (r *Register) Stop() {
-	r.revoke()
-	close(r.closeChan)
+	r.stopOnce.Do(func() {
+		if err := r.revoke(); err != nil {
+			log.Printf("[Register] revoke failed: %+v", err)
+		}
+
+		close(r.closeChan)
+
+		if r.cli != nil {
+			_ = r.cli.Close()
+		}
+	})
 }
 
-func (r *Register) register() (err error) {
+func (r *Register) register() error {
 	r.leaseId = 0
+
 	kv := clientv3.NewKV(r.cli)
 	r.lease = clientv3.NewLease(r.cli)
-	leaseResp, err := r.lease.Grant(context.TODO(), _ttl)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	leaseResp, err := r.lease.Grant(ctx, _ttl)
 	if err != nil {
-		err = errors.Wrapf(err, "[Register] register Grant err")
-		return
+		return errors.Wrap(err, "[Register] register Grant err")
 	}
+
 	data, err := json.Marshal(r.info)
-	_, err = kv.Put(context.TODO(), r.info.UniqueId, string(data), clientv3.WithLease(leaseResp.ID))
 	if err != nil {
-		err = errors.Wrapf(err, "[Register] register kv.Put err %s-%+v", r.info.Name, string(data))
-		return
+		return errors.Wrap(err, "[Register] json Marshal err")
 	}
+
+	putCtx, putCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer putCancel()
+
+	_, err = kv.Put(
+		putCtx,
+		r.info.UniqueId,
+		string(data),
+		clientv3.WithLease(leaseResp.ID),
+	)
+	if err != nil {
+		return errors.Wrapf(
+			err,
+			"[Register] register kv.Put err name:%s data:%s",
+			r.info.Name,
+			string(data),
+		)
+	}
+
 	r.leaseId = leaseResp.ID
-	return
+
+	log.Printf(
+		"[Register] registered node:%s leaseId:%d ttl:%d",
+		r.info.UniqueId,
+		r.leaseId,
+		_ttl,
+	)
+
+	return nil
 }
 
-func (r *Register) keepAlive() (err error) {
-	_, err = r.lease.KeepAliveOnce(context.TODO(), r.leaseId)
+func (r *Register) keepAlive() error {
+	if r.lease == nil || r.leaseId == 0 {
+		return errors.Errorf("[Register] invalid lease state leaseId:%d", r.leaseId)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := r.lease.KeepAliveOnce(ctx, r.leaseId)
 	if err != nil {
-		// 租约丢失，重新注册
-		if err == rpctypes.ErrLeaseNotFound {
-			r.register()
-			err = nil
+		log.Printf(
+			"[Register] keepAlive failed, will re-register. node:%s leaseId:%d err:%+v",
+			r.info.UniqueId,
+			r.leaseId,
+			err,
+		)
+
+		if regErr := r.register(); regErr != nil {
+			return errors.Wrap(regErr, "[Register] re-register failed")
 		}
-		err = errors.Wrapf(err, "[Register] keepAlive err")
+
+		return nil
 	}
 
 	if common.Mode() == common.DebugMode {
 		log.Printf(fmt.Sprintf("[Register] keepalive... leaseId:%+v", r.leaseId))
 	}
 
-	return err
+	return nil
 }
 
-func (r *Register) revoke() (err error) {
-	_, err = r.cli.Revoke(context.TODO(), r.leaseId)
-	if err != nil {
-		err = errors.Wrapf(err, "[Register] revoke err")
-		return
+func (r *Register) revoke() error {
+	if r.cli == nil || r.leaseId == 0 {
+		return nil
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := r.cli.Revoke(ctx, r.leaseId)
+	if err != nil {
+		return errors.Wrap(err, "[Register] revoke err")
+	}
+
 	if common.Mode() == common.DebugMode {
 		log.Printf(fmt.Sprintf("[Register] revoke node:%+v", r.leaseId))
 	}
-	return
+
+	return nil
 }
